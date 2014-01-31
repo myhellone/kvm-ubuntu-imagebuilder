@@ -8,7 +8,7 @@ R="saucy"           # release
 MR="./roottemp"     # mounted root
 RI="./raw.img"      # raw image
 VGN="vmvg0"         # volume group name
-DSIZE="25G"          # disk size
+DSIZE="25G"         # disk size
 
 DATE="$(date +%Y%m%d)"
 LOOPDEV="/dev/loop5"
@@ -21,7 +21,12 @@ function detect_local_mirror () {
     if [ -n "$AL" ]; then
         NAME="$(echo \"$AL\" | cut -d\; -f 8)"
         PORT="$(echo \"$AL\" | cut -d\; -f 9)"
-        UM="http://${NAME}:${PORT}/ubuntu/"
+        if [ $PORT -eq 80 ]; then
+            UM="http://${NAME}/ubuntu/"
+        else
+            UM="http://${NAME}:${PORT}/ubuntu/"
+        fi
+
     fi
     if [ -z "$UM" ]; then
         # maybe try hetzner mirror?
@@ -40,6 +45,7 @@ function detect_local_mirror () {
 
 UM="$(detect_local_mirror)"
 
+# create sparse file and partition it
 dd if=/dev/zero of=$RI bs=1 count=0 seek=$DSIZE
 parted -s $RI mklabel msdos
 parted -a optimal $RI mkpart primary 0% 200MiB
@@ -47,20 +53,26 @@ parted -a optimal $RI mkpart primary 200MiB 100%
 parted $RI set 1 boot on
 losetup $LOOPDEV $RI
 kpartx -av $LOOPDEV
+
+# make boot filesystem:
 mkfs.ext4 -L BOOT /dev/mapper/${LDBASE}p1
 tune2fs -c -1 /dev/mapper/${LDBASE}p1
+
+# create root vg and filesystem:
 pvcreate /dev/mapper/${LDBASE}p2
 vgcreate $VGN /dev/mapper/${LDBASE}p2
 lvcreate -l 100%FREE -n root $VGN
 mkfs.ext4 -L ROOT /dev/$VGN/root
+
+# mount stuff
 mkdir -p $MR
 MR="$(readlink -f $MR)"
 mount /dev/$VGN/root $MR
 mkdir $MR/boot
 mount /dev/mapper/${LDBASE}p1 $MR/boot
 
-echo "*** installing base $R system from $UM..."
 # install base:
+echo "*** installing base $R system from $UM..."
 debootstrap --arch amd64 $R $MR $UM
 
 # temporary config for install:
@@ -70,11 +82,13 @@ for P in updates backports security ; do
     echo "deb $UM $R-$P $RPS" >> $MR/etc/apt/sources.list
 done
 
+# disable apt installation exuberance
 cat > $MR/etc/apt/apt.conf.d/99-vm-no-extras-please <<EOF
 APT::Install-Recommends "false";
 APT::Install-Suggest "false";
 EOF
 
+# default to google resolver for now
 cat > $MR/etc/resolv.conf <<EOF
 nameserver 8.8.8.8
 nameserver 8.8.4.4
@@ -111,7 +125,6 @@ iface lo inet loopback
 auto eth0
 iface eth0 inet dhcp
 EOF
-echo "localhost" > $MR/etc/hostname
 
 cat > $MR/etc/hosts <<EOF
 127.0.0.1 localhost
@@ -129,6 +142,8 @@ mount --bind /proc $MR/proc
 mount --bind /dev $MR/dev
 mount --bind /sys $MR/sys
 
+# this file keeps stuff from starting up right now 
+# when first installed in the chroot.
 cat > $MR/usr/sbin/policy-rc.d <<EOF
 #!/bin/bash
 exit 101
@@ -140,18 +155,19 @@ export DEBIAN_FRONTEND=noninteractive
 export RUNLEVEL=1
 apt-get -y update
 
+# acpid is to receive shutdown events from kvm
+# accurate time (ntp) is essential for certificate verification to work 
+# parted is to resize partitions on disk expansion
+
 PACKAGES="
     linux-image-server
     lvm2
     acpid
-    avahi-utils
-    ntp
-    jq
-    curl
-    wget
     openssh-server
+    ntp
     grub2
     grub-pc
+    parted
 "
 apt-get -y install \$PACKAGES
 EOF
@@ -161,12 +177,15 @@ grep -v ^server /etc/ntp.conf > /etc/ntp.conf.new
 mv /etc/ntp.conf.new /etc/ntp.conf
 EOF
 
+# tell ntp not to try to sync to anything
+# if an ntp server comes from the dhcp server then it will use that
 cat >> $MR/etc/ntp.conf <<EOF
 server 127.127.1.0
 fudge 127.127.1.0 stratum 10
 broadcastclient
 EOF
 
+# set some sane grub defaults for kvm guests
 echo "GRUB_CMDLINE_LINUX_DEFAULT=\"text serial=tty0 console=ttyS0\"" \
     >> $MR/etc/default/grub
 echo "GRUB_SERIAL_COMMAND=\"serial --unit=0 --speed=9600 --stop=1\"" \
@@ -174,8 +193,10 @@ echo "GRUB_SERIAL_COMMAND=\"serial --unit=0 --speed=9600 --stop=1\"" \
 echo "GRUB_TERMINAL=\"serial\"" >> $MR/etc/default/grub
 echo "GRUB_GFXPAYLOAD=\"text\"" >> $MR/etc/default/grub
 
+# set root password (only useful at console, ssh password login is disabled)
 chroot $MR /bin/bash -c "echo \"root:$ROOTPW\" | chpasswd"
 
+# generate grub configs and install it to the generated blockdev
 chroot $MR update-grub 2> /dev/null
 chroot $MR grub-mkconfig -o /boot/grub/grub.cfg 2> /dev/null
 cat > $MR/boot/grub/device.map <<EOF
@@ -183,15 +204,18 @@ cat > $MR/boot/grub/device.map <<EOF
 EOF
 chroot $MR grub-install ${LOOPDEV} 2> /dev/null
 
-# get rid of device.map after grub is installed...
+# get rid of temporary device.map after grub is installed
 rm $MR/boot/grub/device.map
 
+# remove initramfs entirely:
 chroot $MR update-initramfs -d -k all
-# for some stupid reason, -k all doesn't work after removing:
+
+# for some stupid reason, -k all doesn't work on gen after removing:
 KERN="$(cd $MR/boot && ls vmlinuz*)"
 VER="${KERN#vmlinuz-}"
 chroot $MR update-initramfs -c -k $VER
 
+# start a getty on the serial port for kvm console login
 cat > $MR/etc/init/ttyS0.conf <<EOF
 # ttyS0 - getty
 # run a getty on the serial console
@@ -208,38 +232,7 @@ chroot $MR dpkg --remove-architecture i386
 chroot $MR /bin/bash -c \
     "DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get -y upgrade"
 
-#FIXME remove for slim image
-export PACKAGES="
-    build-essential
-    byobu
-    command-not-found
-    daemontools
-    duplicity
-    git-core
-    htop
-    iftop
-    iotop
-    iptraf
-    lft
-    lsof
-    make
-    make
-    man-db
-    mtr
-    pciutils
-    psmisc
-    pv
-    python-pip
-    rsync
-    screen
-    strace
-    tcpdump
-    telnet
-    traceroute
-    vim
-"
-chroot $MR apt-get -y install $PACKAGES
-
+# remove file that keeps installed stuff from starting up
 rm $MR/usr/sbin/policy-rc.d
 
 #####################################################
@@ -247,8 +240,7 @@ rm $MR/usr/sbin/policy-rc.d
 #####################################################
 
 cat > $MR/etc/dhcp/dhclient-exit-hooks.d/hostname <<EOF
-echo \$new_host_name > /etc/hostname
-hostname -F /etc/hostname
+hostname \$new_host_name
 EOF
 
 # install ssh key
@@ -263,22 +255,45 @@ rm $MR/var/cache/apt/archives/*.deb
 
 # set dist apt source:
 RPS="main restricted multiverse universe"
-MURL="http://mirror.local/ubuntu/"
+MURL="http://mirror.localservice/ubuntu/"
 echo "deb $MURL $R $RPS" > $MR/etc/apt/sources.list
 for P in updates backports security ; do
     echo "deb $MURL $R-$P $RPS" >> $MR/etc/apt/sources.list
 done
 
-# clear issue
-echo "clear > /etc/issue" | chroot $MR
-
 # remove instance ssh host keys
 rm $MR/etc/ssh/*key*
+rm $MR/var/lib/dhcp/*.leases
+
+# remove temporary resolver, dhcp will fix it:
+rm $MR/etc/resolv.conf
+
+# if there is an /etc/hostname then it won't
+# pick up the right hostname from dhcp
+test -e $MR/etc/hostname || rm $MR/etc/hostname
+
+mkdir $MR/lib/eeqjvmtools
+
+cat > $MR/lib/eeqjvmtools/expandroot.sh <<EOF
+#!/bin/bash
+parted -- /dev/vda resizepart 2 -1s
+partprobe /dev/vda
+pvresize /dev/vda2
+lvresize -l +100%FREE /dev/vmvg0/root || true
+resize2fs /dev/vmvg0/root
+EOF
+chmod +x $MR/lib/eeqjvmtools/expandroot.sh
 
 # regenerate them on first boot
 cat > $MR/etc/rc.local <<EOF
 #!/bin/bash
+
+# if no ssh host keys, generate them 
 test -f /etc/ssh/ssh_host_dsa_key || dpkg-reconfigure openssh-server
+
+# if the drive has gotten bigger since last time, grow the fs:
+/lib/eeqjvmtools/expandroot.sh 
+
 exit 0
 EOF
 chmod +x $MR/etc/rc.local
@@ -286,7 +301,6 @@ chmod +x $MR/etc/rc.local
 echo "******************************************************"
 echo "*** Almost done.  Cleaning up..."
 echo "******************************************************"
-
 
 umount $MR/proc
 umount $MR/sys

@@ -34,6 +34,8 @@ function set_apt_mirror () {
 
 
 set_apt_mirror "mirror://mirrors.ubuntu.com/mirrors.txt"
+rm /etc/dpkg/dpkg.cfg.d/multiarch
+#dpkg --remove-architecture i386 # only on later ubuntu
 apt-get update
 apt-get -y install avahi-utils jq curl
 
