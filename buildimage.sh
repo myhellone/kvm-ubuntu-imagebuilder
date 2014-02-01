@@ -172,6 +172,18 @@ PACKAGES="
 apt-get -y install \$PACKAGES
 EOF
 
+# install chef and ohai for provisioning later
+chroot $MR <<EOF
+set -e
+export DEBIAN_FRONTEND=noninteractive
+export RUNLEVEL=1
+apt-get install -y \
+        ruby ruby1.8-dev build-essential wget libruby1.8 rubygems
+gem update --no-rdoc --no-ri
+gem install ohai --no-rdoc --no-ri --verbose 
+gem install chef --no-rdoc --no-ri --verbose
+EOF
+
 chroot $MR <<EOF
 grep -v ^server /etc/ntp.conf > /etc/ntp.conf.new
 mv /etc/ntp.conf.new /etc/ntp.conf
