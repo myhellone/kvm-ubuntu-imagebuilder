@@ -5,22 +5,17 @@
 VAGRANTFILE_API_VERSION = "2"
 
 SETUP_BASE = <<-EOF
+#!/bin/bash
+
+set -e
+
+# byobu lags login in this vm for some reason?
+test -e /etc/profile.d/Z97-byobu.sh && rm /etc/profile.d/Z97-byobu.sh
 
 echo "UseDNS no" >> /etc/ssh/sshd_config
 service ssh restart
 
-function detect_local_mirror () {
-    AL="$(avahi-browse -p -t -r _ubuntumirror._tcp | grep '^=' | head -1)"
-    if [ -n "$AL" ]; then
-        NAME="$(echo \"$AL\" | cut -d';' -f 8)"
-        PORT="$(echo \"$AL\" | cut -d';' -f 9)"
-        UM="http://${NAME}:${PORT}/ubuntu/"
-        MOK="$(curl --head \"${UM}ls-lR.gz\" 2>&1 | grep '200 OK' | wc -l)"
-        if [ $MOK -gt 0 ]; then
-            echo "$UM"
-        fi
-    fi
-}
+echo "exec sudo -i" >> /home/vagrant/.bashrc
 
 function set_apt_mirror () {
     CN="$(lsb_release -c -s)"
@@ -32,35 +27,46 @@ function set_apt_mirror () {
     mv /etc/apt/sources.list.new /etc/apt/sources.list
 }
 
+export UBUNTU_MIRROR_URL="`cat /vagrant/ubuntu-mirror.tmp`"
 
-set_apt_mirror "mirror://mirrors.ubuntu.com/mirrors.txt"
-rm /etc/dpkg/dpkg.cfg.d/multiarch
-#dpkg --remove-architecture i386 # only on later ubuntu
-apt-get update
-apt-get -y install avahi-utils jq curl
-
-UM="$(detect_local_mirror)"
-if [ -n "$UM" ]; then
-    echo "Detected LAN ubuntu mirror at $UM - configuring!"
-    set_apt_mirror "$UM"
+if [[ ! -z "$UBUNTU_MIRROR_URL" ]]; then
+    set_apt_mirror "$UBUNTU_MIRROR_URL"
 fi
-echo "**********************************************************"
-echo "**********************************************************"
-cat /etc/apt/sources.list
-echo "**********************************************************"
-echo "**********************************************************"
+
+if [[ "$(lsb_release -s -c)" == "saucy" ]]; then
+    dpkg --remove-architecture i386
+else
+    rm /etc/dpkg/dpkg.cfg.d/multiarch
+fi
 apt-get update
 apt-get -y install kpartx debootstrap lvm2 qemu-utils 
-EOF
 
+DISTS="precise saucy"
+
+for DIST in $DISTS; do
+    cd / 
+    /vagrant/buildimage.sh $DIST && \
+    mv ./*.qcow2 /vagrant
+done
+
+EOF
 
 Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
   config.vm.box = "ubuntu-12.04"
   config.vm.box_url = "http://cloud-images.ubuntu.com/vagrant/precise/" + \
     "current/precise-server-cloudimg-amd64-vagrant-disk1.box"
-  config.vm.network "public_network", :bridge => "en4: Display Ethernet"
+  config.cache.auto_detect = true if Vagrant.has_plugin?("vagrant-cachier")
+
+  # bridge to my actual local lan instead of the private vagrant
+  # network so that avahi discover will work right to find my mirror
+  # osx requires it to be the full descriptive name, mine is e.g.
+  # "en4: Display Ethernet" (tb display wired ethernet)
+  if ENV['VAGRANT_BRIDGE_DEVICE']
+    config.vm.network "public_network",
+      :bridge => ENV['VAGRANT_BRIDGE_DEVICE']
+  end
+
   config.vm.provision "shell", inline: SETUP_BASE
-  config.vm.provision "shell", path: "buildimage.sh"
   config.vm.provider :virtualbox do |vb|
     vb.customize ["modifyvm", :id, "--memory", "2048"]
   end

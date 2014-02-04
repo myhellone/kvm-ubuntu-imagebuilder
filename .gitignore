@@ -1,3 +1,5 @@
 .vagrant
 *.bz2
 *.qcow2
+*.tmp
+authorized_keys

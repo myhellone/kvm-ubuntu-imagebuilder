@@ -4,43 +4,44 @@ set -e
 set -v
 set -x
 
-R="saucy"           # release
-MR="./roottemp"     # mounted root
-RI="./raw.img"      # raw image
+ORGNAME="eeqj"
+R="$1"           # release
+SUPPORTED="precise saucy"
+
+# set to squeeze every last byte out of the images
+#SAVESPACE=1
+
+if [[ $# -ne 1 ]]; then
+    echo "usage: $0 <codename>" > /dev/stderr
+    echo "supported ubuntu releases: $SUPPORTED" > /dev/stderr
+    exit 127
+fi
+
+if ! [[ "$SUPPORTED" =~ "$R" ]] ; then
+    echo "$0: unsupported ubuntu release $R, sorry." > /dev/stderr
+    exit 127
+fi
+
+MR="./build-${R}-chroot"
+RI="./build-${R}-raw.img"      # raw image
 VGN="vmvg0"         # volume group name
 DSIZE="25G"         # disk size
 
-DATE="$(date +%Y%m%d)"
+DATE="$(date -u +%Y%m%d)"
+LONGDATE="$(date -u +%Y-%m-%dT%H:%M:%S%z)"
 LOOPDEV="/dev/loop5"
+BOOTPARTLOOP="/dev/loop6"
 LDBASE="$(basename $LOOPDEV)"
-ROOTPW="7c493cc530734f4c11e00bcecadb7b73"
+ROOTPW="root"
 
 function detect_local_mirror () {
-    AL="$(avahi-browse -p -t -r _ubuntumirror._tcp | grep '^=' | head -1)"
-    UM=""
-    if [ -n "$AL" ]; then
-        NAME="$(echo \"$AL\" | cut -d\; -f 8)"
-        PORT="$(echo \"$AL\" | cut -d\; -f 9)"
-        if [ $PORT -eq 80 ]; then
-            UM="http://${NAME}/ubuntu/"
-        else
-            UM="http://${NAME}:${PORT}/ubuntu/"
-        fi
-
-    fi
-    if [ -z "$UM" ]; then
-        # maybe try hetzner mirror?
-        UM="http://mirror.hetzner.de/ubuntu/packages/" 
-        TF="${UM}/dists/${R}/Release"
-        MOK="$(curl --head ${TF} 2>&1 | grep '200 OK' | wc -l)"
-        if [ $MOK -gt 0 ]; then
-            echo "$UM"
-        else
-            echo "http://archive.ubuntu.com/ubuntu/"
-        fi  
-    else 
-        echo "$UM"
-    fi
+    TF="${UBUNTU_MIRROR_URL}/dists/${R}/Release"
+    MOK="$(curl -m 1 --head ${TF} 2>&1 | grep '200 OK' | wc -l)"
+    if [ $MOK -gt 0 ]; then
+        echo "$UBUNTU_MIRROR_URL"
+    else
+        echo "http://archive.ubuntu.com/ubuntu/"
+    fi  
 }
 
 UM="$(detect_local_mirror)"
@@ -53,23 +54,31 @@ parted -a optimal $RI mkpart primary 200MiB 100%
 parted $RI set 1 boot on
 losetup $LOOPDEV $RI
 kpartx -av $LOOPDEV
+losetup $BOOTPARTLOOP /dev/mapper/${LDBASE}p1
 
 # make boot filesystem:
-mkfs.ext4 -L BOOT /dev/mapper/${LDBASE}p1
-tune2fs -c -1 /dev/mapper/${LDBASE}p1
+if [[ "$R" == "saucy" ]]; then
+    FSTYPE="ext4"
+else
+    FSTYPE="ext3"
+fi
+
+mkfs.${FSTYPE} -L BOOT $BOOTPARTLOOP
+tune2fs -c -1 $BOOTPARTLOOP
+
 
 # create root vg and filesystem:
 pvcreate /dev/mapper/${LDBASE}p2
 vgcreate $VGN /dev/mapper/${LDBASE}p2
 lvcreate -l 100%FREE -n root $VGN
-mkfs.ext4 -L ROOT /dev/$VGN/root
+mkfs.${FSTYPE} -L ROOT /dev/$VGN/root
 
 # mount stuff
 mkdir -p $MR
 MR="$(readlink -f $MR)"
 mount /dev/$VGN/root $MR
 mkdir $MR/boot
-mount /dev/mapper/${LDBASE}p1 $MR/boot
+mount $BOOTPARTLOOP $MR/boot
 
 # install base:
 echo "*** installing base $R system from $UM..."
@@ -98,7 +107,9 @@ cat > $MR/etc/environment <<EOF
 PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 LANGUAGE="en_US:en"
 LANG="en_US.UTF-8"
-ROOT_IMAGE_BUILD_DATE="$DATE"
+ROOT_IMAGE_BUILD_DAY="$DATE"
+ROOT_IMAGE_BUILD_DATE="$LONGDATE"
+ROOT_IMAGE_BUILD_ORG="$ORGNAME"
 EOF
 
 chroot $MR locale-gen en_US.UTF-8
@@ -106,14 +117,14 @@ chroot $MR dpkg-reconfigure locales
 
 echo 'cd /dev && MAKEDEV generic 2>/dev/null' | chroot $MR 
 
-BUUID="$(blkid -s UUID -o value /dev/mapper/${LDBASE}p1)"
+BUUID="$(blkid -s UUID -o value $BOOTPARTLOOP)"
 RUUID="$(blkid -s UUID -o value /dev/${VGN}/root)"
 
 # this has to come before packages:
 cat > $MR/etc/fstab <<EOF
 proc                    /proc     proc  defaults                  0  0
-/dev/mapper/$VGN-root   /         ext4  noatime,errors=remount-ro 0  1
-UUID=$BUUID             /boot     ext4  noatime                   0  2
+/dev/mapper/$VGN-root   /         $FSTYPE  noatime,errors=remount-ro 0  1
+UUID=$BUUID             /boot     $FSTYPE  noatime                   0  2
 none                    /tmp      tmpfs defaults                  0  0
 none                    /var/tmp  tmpfs defaults                  0  0
 EOF
@@ -150,6 +161,16 @@ exit 101
 EOF
 chmod +x $MR/usr/sbin/policy-rc.d
 
+# banish i386 forevermore, saucy
+if [[ "$R" == "saucy" ]]; then
+    chroot $MR dpkg --remove-architecture i386
+fi
+
+# i386 banishment for precise
+if [[ -e $MR/etc/dpkg/dpkg.cfg.d/multiarch ]] ; then
+    rm $MR/etc/dpkg/dpkg.cfg.d/multiarch
+fi
+
 chroot $MR <<EOF
 export DEBIAN_FRONTEND=noninteractive
 export RUNLEVEL=1
@@ -158,16 +179,15 @@ apt-get -y update
 # acpid is to receive shutdown events from kvm
 # accurate time (ntp) is essential for certificate verification to work 
 # parted is to resize partitions on disk expansion
-
 PACKAGES="
     linux-image-server
     lvm2
     acpid
     openssh-server
     ntp
+    parted
     grub2
     grub-pc
-    parted
 "
 apt-get -y install \$PACKAGES
 EOF
@@ -178,7 +198,7 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 export RUNLEVEL=1
 apt-get install -y \
-        ruby ruby1.8-dev build-essential wget libruby1.8 rubygems
+        ruby ruby-dev build-essential wget libruby rubygems
 gem update --no-rdoc --no-ri
 gem install ohai --no-rdoc --no-ri --verbose 
 gem install chef --no-rdoc --no-ri --verbose
@@ -200,19 +220,21 @@ EOF
 # set some sane grub defaults for kvm guests
 echo "GRUB_CMDLINE_LINUX_DEFAULT=\"text serial=tty0 console=ttyS0\"" \
     >> $MR/etc/default/grub
+# FIXME i think this is bogus, test changing it
 echo "GRUB_SERIAL_COMMAND=\"serial --unit=0 --speed=9600 --stop=1\"" \
     >> $MR/etc/default/grub
-echo "GRUB_TERMINAL=\"serial\"" >> $MR/etc/default/grub
+if [[ "$R" == "saucy" ]]; then 
+    echo "GRUB_TERMINAL=\"serial\"" >> $MR/etc/default/grub
+fi
 echo "GRUB_GFXPAYLOAD=\"text\"" >> $MR/etc/default/grub
 
 # set root password (only useful at console, ssh password login is disabled)
 chroot $MR /bin/bash -c "echo \"root:$ROOTPW\" | chpasswd"
 
-# generate grub configs and install it to the generated blockdev
-chroot $MR update-grub 2> /dev/null
 chroot $MR grub-mkconfig -o /boot/grub/grub.cfg 2> /dev/null
 cat > $MR/boot/grub/device.map <<EOF
 (hd0)   ${LOOPDEV}
+(hd0,1) ${BOOTPARTLOOP}
 EOF
 chroot $MR grub-install ${LOOPDEV} 2> /dev/null
 
@@ -228,6 +250,7 @@ VER="${KERN#vmlinuz-}"
 chroot $MR update-initramfs -c -k $VER
 
 # start a getty on the serial port for kvm console login
+if [[ "$R" == "saucy" ]]; then 
 cat > $MR/etc/init/ttyS0.conf <<EOF
 # ttyS0 - getty
 # run a getty on the serial console
@@ -236,9 +259,8 @@ stop on runlevel [!12345]
 respawn
 exec /sbin/getty -L 115200 ttyS0 vt102
 EOF
+fi
 
-# disable multiarch, banish i386 forevermore
-chroot $MR dpkg --remove-architecture i386
 
 # update all packages on the system
 chroot $MR /bin/bash -c \
@@ -257,9 +279,11 @@ EOF
 
 # install ssh key
 mkdir -p $MR/root/.ssh
-cp /root/.ssh/authorized_keys $MR/root/.ssh/
+cp ./authorized_keys $MR/root/.ssh/
 
+# key auth only
 echo "PasswordAuthentication no" >> $MR/etc/ssh/sshd_config
+# in case dns is broken, don't lag logins
 echo "UseDNS no" >> $MR/etc/ssh/sshd_config
 
 # clean apt cache
@@ -267,7 +291,7 @@ rm $MR/var/cache/apt/archives/*.deb
 
 # set dist apt source:
 RPS="main restricted multiverse universe"
-MURL="http://mirror.localservice/ubuntu/"
+MURL="http://archive.ubuntu.com/ubuntu"
 echo "deb $MURL $R $RPS" > $MR/etc/apt/sources.list
 for P in updates backports security ; do
     echo "deb $MURL $R-$P $RPS" >> $MR/etc/apt/sources.list
@@ -304,7 +328,7 @@ cat > $MR/etc/rc.local <<EOF
 test -f /etc/ssh/ssh_host_dsa_key || dpkg-reconfigure openssh-server
 
 # if the drive has gotten bigger since last time, grow the fs:
-/lib/eeqjvmtools/expandroot.sh 
+test -x /lib/eeqjvmtools/expandroot.sh && /lib/eeqjvmtools/expandroot.sh 
 
 exit 0
 EOF
@@ -318,30 +342,35 @@ umount $MR/proc
 umount $MR/sys
 
 # udev insists on sticking around, kill it:
-fuser -m $MR -k
-sleep 1
+if [[ "$R" == "saucy" ]]; then
+    fuser -m $MR -k
+    sleep 1
+fi
 umount $MR/dev
 
-# zero space on boot:
-dd if=/dev/zero of=$MR/boot/zerofile bs=1M || true
-rm $MR/boot/zerofile
+if [[ $SAVESPACE ]]; then
+    # zero space on boot:
+    dd if=/dev/zero of=$MR/boot/zerofile bs=1M || true
+    sync
+    rm $MR/boot/zerofile
+    # zero space on root
+    dd if=/dev/zero of=$MR/zerofile bs=1M || true
+    sync
+    rm $MR/zerofile
+fi
+
 umount $MR/boot
-
-# zero space on root:
-dd if=/dev/zero of=$MR/zerofile bs=1M || true
-rm $MR/zerofile
-
 umount $MR
+sync
 
 rmdir $MR
 
+losetup -d $BOOTPARTLOOP
 vgchange -a n $VGN
 kpartx -dv $LOOPDEV
 losetup -d $LOOPDEV
-
-qemu-img convert -f raw -O qcow2 $RI ${R}64.qcow2 && rm $RI
 sync
-echo "******************************************************"
-echo "*** Image generation completed successfully."
-echo "*** output: ${R}64.qcow2"
-echo "******************************************************"
+
+OF="./${DATE}-${ORGNAME}-${R}64.qcow2"
+
+qemu-img convert -f raw -O qcow2 $RI $OF && rm $RI
