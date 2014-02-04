@@ -1,38 +1,50 @@
 #!/bin/bash
-
 set -e
 set -v
 set -x
 
+SAVESPACE=1
+WITHCHEF=1
 ORGNAME="eeqj"
-R="$1"           # release
-SUPPORTED="precise saucy"
+DSIZE="25G"         # disk size
 
-# set to squeeze every last byte out of the images
-#SAVESPACE=1
+# releases we support right now
+SUPPORTED="precise saucy"
 
 if [[ $# -ne 1 ]]; then
     echo "usage: $0 <codename>" > /dev/stderr
     echo "supported ubuntu releases: $SUPPORTED" > /dev/stderr
     exit 127
 fi
-
+R="$1"          # release
 if ! [[ "$SUPPORTED" =~ "$R" ]] ; then
     echo "$0: unsupported ubuntu release $R, sorry." > /dev/stderr
     exit 127
 fi
 
-MR="./build-${R}-chroot"
-RI="./build-${R}-raw.img"      # raw image
+MR="/tmp/kvmbuild-${R}"
+RI="/tmp/kvmbuild-${R}.img"      # raw image
 VGN="vmvg0"         # volume group name
-DSIZE="25G"         # disk size
-
 DATE="$(date -u +%Y%m%d)"
 LONGDATE="$(date -u +%Y-%m-%dT%H:%M:%S%z)"
-LOOPDEV="/dev/loop5"
-BOOTPARTLOOP="/dev/loop6"
+LOOPDEV="$(losetup -f)"
 LDBASE="$(basename $LOOPDEV)"
 ROOTPW="root"
+
+if [[ -e /dev/$VGN ]]; then
+    echo "$0: error, vg $VGN already exists" > /dev/stderr
+    exit 127
+fi
+
+if [[ -e "$MR" ]]; then
+    echo "$0: error, chroot dir $MR already exists" > /dev/stderr
+    exit 127
+fi
+
+if [[ -e "$RI" ]]; then
+    echo "$0: error, intermediate image file $RI already exists" > /dev/stderr
+    exit 127
+fi
 
 function detect_local_mirror () {
     TF="${UBUNTU_MIRROR_URL}/dists/${R}/Release"
@@ -54,6 +66,7 @@ parted -a optimal $RI mkpart primary 200MiB 100%
 parted $RI set 1 boot on
 losetup $LOOPDEV $RI
 kpartx -av $LOOPDEV
+BOOTPARTLOOP="$(losetup -f)"
 losetup $BOOTPARTLOOP /dev/mapper/${LDBASE}p1
 
 # make boot filesystem:
@@ -65,7 +78,6 @@ fi
 
 mkfs.${FSTYPE} -L BOOT $BOOTPARTLOOP
 tune2fs -c -1 $BOOTPARTLOOP
-
 
 # create root vg and filesystem:
 pvcreate /dev/mapper/${LDBASE}p2
@@ -186,12 +198,12 @@ PACKAGES="
     openssh-server
     ntp
     parted
-    grub2
     grub-pc
 "
 apt-get -y install \$PACKAGES
 EOF
 
+if [[ $WITHCHEF ]]; then
 # install chef and ohai for provisioning later
 chroot $MR <<EOF
 set -e
@@ -203,6 +215,7 @@ gem update --no-rdoc --no-ri
 gem install ohai --no-rdoc --no-ri --verbose 
 gem install chef --no-rdoc --no-ri --verbose
 EOF
+fi
 
 chroot $MR <<EOF
 grep -v ^server /etc/ntp.conf > /etc/ntp.conf.new
@@ -261,7 +274,6 @@ exec /sbin/getty -L 115200 ttyS0 vt102
 EOF
 fi
 
-
 # update all packages on the system
 chroot $MR /bin/bash -c \
     "DEBIAN_FRONTEND=noninteractive RUNLEVEL=1 apt-get -y upgrade"
@@ -279,7 +291,8 @@ EOF
 
 # install ssh key
 mkdir -p $MR/root/.ssh
-cp ./authorized_keys $MR/root/.ssh/
+cp "${KEYFILE}" $MR/root/.ssh/authorized_keys
+chmod 600 $MR/root/.ssh/authorized_keys
 
 # key auth only
 echo "PasswordAuthentication no" >> $MR/etc/ssh/sshd_config
@@ -365,12 +378,12 @@ sync
 
 rmdir $MR
 
-losetup -d $BOOTPARTLOOP
 vgchange -a n $VGN
+losetup -d $BOOTPARTLOOP
 kpartx -dv $LOOPDEV
 losetup -d $LOOPDEV
 sync
 
-OF="./${DATE}-${ORGNAME}-${R}64.qcow2"
+OF="/tmp/${DATE}-${ORGNAME}-${R}64.qcow2"
 
 qemu-img convert -f raw -O qcow2 $RI $OF && rm $RI

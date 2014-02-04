@@ -10,20 +10,15 @@ setup: clean
 	cp $(HOME)/.ssh/id_rsa.pub ./authorized_keys
 
 gen: setup
-	if [[ $$(uname) == "Darwin" ]]; then \
-		vagrant destroy -f \
-		vagrant up \
-	else \
-		export UBUNTU_MIRROR_URL="$(cat ./ubuntu-mirror.tmp)" \
-		for D in precise saucy ; do \
-			./buildimage.sh $D \
-		done \
-	fi
+	./gen.sh
 
 upload:
-	rsync -azvP saucy64-$(YYYYMMDD).qcow2 \
+	rsync -avzP ./*.qcow2 \
 		$(KVM_REMOTE_HOST):/storage/images/
 
-sync:
-	rsync -avP ./*.sh \
+sync: clean
+	rsync -avP \
+		--exclude=/.git		\
+		--exclude=/.vagrant	\
+		./					\
 		$(KVM_REMOTE_HOST):/storage/buildimage/

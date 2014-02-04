@@ -6,7 +6,6 @@ VAGRANTFILE_API_VERSION = "2"
 
 SETUP_BASE = <<-EOF
 #!/bin/bash
-
 set -e
 
 # byobu lags login in this vm for some reason?
@@ -44,9 +43,10 @@ apt-get -y install kpartx debootstrap lvm2 qemu-utils
 DISTS="precise saucy"
 
 for DIST in $DISTS; do
-    cd / 
-    /vagrant/buildimage.sh $DIST && \
-    mv ./*.qcow2 /vagrant
+    export KEYFILE="/vagrant/authorized_keys"
+    /vagrant/buildimage.sh $DIST || exit $?
+    mv /tmp/*64.qcow2 /vagrant/
+    exit 0 # FIXME
 done
 
 EOF
